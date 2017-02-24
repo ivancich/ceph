@@ -20,7 +20,7 @@
 #include "osd/osd_types.h"
 #include "include/ceph_features.h"
 #include <atomic>
-
+#include "common/mClockCommon.h"
 /*
  * OSD op
  *
@@ -33,7 +33,7 @@ class OSD;
 
 class MOSDOp : public Message {
 
-  static const int HEAD_VERSION = 7;
+  static const int HEAD_VERSION = 8;
   static const int COMPAT_VERSION = 3;
 
 private:
@@ -65,6 +65,7 @@ private:
   uint64_t features;
 
   osd_reqid_t reqid; // reqid explicitly set by sender
+  dmc::ReqParams qos_params;
 
 public:
   friend class MOSDOpReply;
@@ -78,6 +79,7 @@ public:
   void set_reqid(const osd_reqid_t rid) {
     reqid = rid;
   }
+  void set_qos_params(const dmc::ReqParams& p) { qos_params = p; }
 
   // Fields decoded in partial decoding
   const pg_t& get_pg() const {
@@ -107,6 +109,10 @@ public:
                          reqid.inc,
 			 header.tid);
     }
+  }
+  const dmc::ReqParams& get_qos_params() const {
+    assert(!partial_decode_needed);
+    return qos_params;
   }
 
   // Fields decoded in final decoding
@@ -326,13 +332,22 @@ struct ceph_osd_request_head {
 	::encode(osd_reqid_t(), payload);
       }
     } else {
-      // new, reordered, v7 message encoding
-      header.version = HEAD_VERSION;
+      // new, reordered message encoding
+      // v8 for dmclock use, otherwise v7
+      if ((features & CEPH_FEATURE_QOS_DMC) != 0) {
+        header.version = HEAD_VERSION;
+      } else {
+        header.version = 7;
+      }
+
       ::encode(pgid, payload);
       ::encode(osdmap_epoch, payload);
       ::encode(flags, payload);
       ::encode(reassert_version, payload);
       ::encode(reqid, payload);
+      if ((features & CEPH_FEATURE_QOS_DMC) != 0) {
+        ::encode(qos_params, payload);
+      }
       ::encode(client_inc, payload);
       ::encode(mtime, payload);
       ::encode(oloc, payload);
@@ -363,6 +378,8 @@ struct ceph_osd_request_head {
 	  ::decode(flags, p);
 	  ::decode(reassert_version, p);
 	  ::decode(reqid, p);
+	  // QoS dmClock
+          ::decode(qos_params, p);
     } else if (header.version < 2) {
       // old decode
       ::decode(client_inc, p);
@@ -465,6 +482,12 @@ struct ceph_osd_request_head {
       // put client_inc in reqid.inc for get_reqid()'s benefit
       if (reqid.name == entity_name_t() && reqid.tid == 0)
 	reqid.inc = client_inc;
+    } else if (header.version < 8) {
+      ::decode(pgid, p);
+      ::decode(osdmap_epoch, p);
+      ::decode(flags, p);
+      ::decode(reassert_version, p);
+      ::decode(reqid, p);
     }
 
     partial_decode_needed = false;
