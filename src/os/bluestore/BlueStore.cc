@@ -7237,6 +7237,10 @@ void BlueStore::_txc_finish_io(TransContext *txc)
     _txc_state_proc(&*p++);
   } while (p != osr->q.end() &&
 	   p->state == TransContext::STATE_IO_DONE);
+
+  if (osr->kv_submitted_waiters) {
+    osr->qcond.notify_all();
+  }
 }
 
 void BlueStore::_txc_write_nodes(TransContext *txc, KeyValueDB::Transaction t)
@@ -7577,6 +7581,10 @@ void BlueStore::_kv_sync_thread()
 	_txc_applied_kv(txc);
 	--txc->osr->kv_committing_serially;
 	txc->state = TransContext::STATE_KV_SUBMITTED;
+	if (txc->osr->kv_submitted_waiters) {
+	  std::lock_guard<std::mutex> l(txc->osr->qlock);
+	  txc->osr->qcond.notify_all();
+	}
       }
       for (auto txc : kv_committing) {
 	if (txc->had_ios) {
