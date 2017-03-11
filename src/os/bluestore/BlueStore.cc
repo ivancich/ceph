@@ -7444,7 +7444,6 @@ void BlueStore::_txc_applied_kv(TransContext *txc)
 	o->flush_cond.notify_all();
       }
     }
-    ls->clear();  // clear out refs
   }
 }
 
