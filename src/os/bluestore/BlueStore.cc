@@ -1661,6 +1661,9 @@ void BlueStore::Blob::discard_unallocated(Collection *coll)
     size_t pos = 0;
     for (auto e : blob.extents) {
       if (!e.is_valid()) {
+	ldout(coll->store->cct, 20) << __func__ << " 0x" << std::hex << pos
+				    << "~" << e.length
+				    << std::dec << dendl;
 	shared_blob->bc.discard(shared_blob->get_cache(), pos, e.length);
       }
       pos += e.length;
@@ -8916,7 +8919,9 @@ void BlueStore::_wctx_finish(
     // longer allocated.  Note that this will leave behind edge bits
     // that are no longer referenced but not deallocated (until they
     // age out of the cache naturally).
-    b->discard_unallocated(c.get());
+    if (!blob.is_shared()) {
+      b->discard_unallocated(c.get());
+    }
     for (auto e : r) {
       dout(20) << __func__ << "  release " << e << dendl;
       txc->released.insert(e.offset, e.length);
