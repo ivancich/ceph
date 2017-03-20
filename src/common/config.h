@@ -366,7 +366,7 @@ protected:
   // of ceph-conf in the same order as declared in config_opts.h
   std::shared_ptr<const std::vector<config_option>> config_options;
   config_option const *find_config_option(const std::string& normalized_key) const;
-};
+}; // struct md_config_t
 
 template<typename T>
 struct get_typed_value_visitor : public boost::static_visitor<T> {

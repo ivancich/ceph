@@ -1628,6 +1628,15 @@ public:
     }
   };
 
+  struct ThrottleMgmtThread : public Thread {
+    BlueStore *store;
+    explicit ThrottleMgmtThread(BlueStore *s) : store(s) {}
+    void *entry() {
+      store->_throttle_mgmt_thread();
+      return NULL;
+    }
+  };
+
   struct DBHistogram {
     struct value_dist {
       uint64_t count;
@@ -1679,6 +1688,11 @@ private:
   std::atomic<uint64_t> nid_max = {0};
   std::atomic<uint64_t> blobid_last = {0};
   std::atomic<uint64_t> blobid_max = {0};
+
+  ThrottleMgmtThread throttle_mgmt_thread;
+  std::mutex throttle_mgmt_lock;
+  std::condition_variable throttle_mgmt_cond;
+  bool throttle_mgmt_stop = false;
 
   Throttle throttle_ops, throttle_bytes;          ///< submit to commit
   Throttle throttle_deferred_ops, throttle_deferred_bytes;  ///< submit to deferred complete
@@ -1898,6 +1912,20 @@ private:
       return *val2;
     }
     return val1;
+  }
+
+  void _throttle_mgmt_thread();
+  void _throttle_mgmt_stop() {
+    {
+      std::lock_guard<std::mutex> l(throttle_mgmt_lock);
+      throttle_mgmt_stop = true;
+      throttle_mgmt_cond.notify_all();
+    }
+    throttle_mgmt_thread.join();
+    {
+      std::lock_guard<std::mutex> l(throttle_mgmt_lock);
+      throttle_mgmt_stop = false;
+    }
   }
 
   // -- ondisk version ---

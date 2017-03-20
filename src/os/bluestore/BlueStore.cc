@@ -1,3 +1,4 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -16,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <chrono>
 
 #include "BlueStore.h"
 #include "os/kv.h"
@@ -3120,6 +3122,7 @@ static void aio_cb(void *priv, void *priv2)
 
 BlueStore::BlueStore(CephContext *cct, const string& path)
   : ObjectStore(cct, path),
+    throttle_mgmt_thread(this),
     throttle_ops(cct, "bluestore_max_ops", cct->_conf->bluestore_max_ops),
     throttle_bytes(cct, "bluestore_max_bytes", cct->_conf->bluestore_max_bytes),
     throttle_deferred_ops(cct, "bluestore_deferred_max_ops",
@@ -3151,6 +3154,7 @@ BlueStore::BlueStore(CephContext *cct,
   const string& path,
   uint64_t _min_alloc_size)
   : ObjectStore(cct, path),
+    throttle_mgmt_thread(this),
     throttle_ops(cct, "bluestore_max_ops", cct->_conf->bluestore_max_ops),
     throttle_bytes(cct, "bluestore_max_bytes", cct->_conf->bluestore_max_bytes),
     throttle_deferred_ops(cct, "bluestore_deferred_max_ops",
@@ -4762,6 +4766,8 @@ int BlueStore::mount()
   _set_csum();
   _set_compression();
 
+  throttle_mgmt_thread.create("bstore_thrt_mgt");
+
   mounted = true;
   return 0;
 
@@ -4801,6 +4807,8 @@ int BlueStore::umount()
 
   dout(20) << __func__ << " stopping kv thread" << dendl;
   _kv_stop();
+  dout(20) << __func__ << " stopping throttle mgmt thread" << dendl;
+  _throttle_mgmt_stop();
   for (auto f : finishers) {
     dout(20) << __func__ << " draining finisher" << dendl;
     f->wait_for_empty();
@@ -7744,6 +7752,25 @@ bluestore_deferred_op_t *BlueStore::_get_deferred_op(
   }
   txc->deferred_txn->ops.push_back(bluestore_deferred_op_t());
   return &txc->deferred_txn->ops.back();
+}
+
+void BlueStore::_throttle_mgmt_thread() {
+  dout(10) << __func__ << " start" << dendl;
+  std::unique_lock<std::mutex> l(throttle_mgmt_lock);
+  std::chrono::seconds wait_time(15);
+  while (true) {
+    if (throttle_mgmt_stop) break;
+    // std::this_thread::sleep_for(wait_time);
+    auto r = throttle_mgmt_cond.wait_for(l, wait_time);
+    if (std::cv_status::timeout == r) {
+      dout(10) << __func__ << " timeout" << dendl;
+      cct->_conf->set_val("bluestore_max_bytes", "68000");
+      cct->_conf->call_all_observers();
+    } else {
+      dout(10) << __func__ << " spurious" << dendl;
+    }
+  }
+  dout(10) << __func__ << " finish" << dendl;
 }
 
 void BlueStore::_deferred_queue(TransContext *txc)
