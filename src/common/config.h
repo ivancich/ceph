@@ -74,6 +74,10 @@ extern const char *CEPH_CONF_FILE_DEFAULT;
  * (conf->foo), one should use either observers or get_val() method
  * (conf->get_val("foo")).
  *
+ * A "metavariable" is one with a value that does/can interpolate
+ * another variable's value into it. This is done with the syntax
+ * "$var_name" or "${var_name}" (without the quotes).
+ *
  * FIXME: really we shouldn't allow changing integer or floating point values
  * while another thread is reading them, either.
  */
