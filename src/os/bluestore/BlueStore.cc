@@ -17,7 +17,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <cmath>
 #include <chrono>
+#include <sstream>
 
 #include "BlueStore.h"
 #include "os/kv.h"
@@ -7754,22 +7756,97 @@ bluestore_deferred_op_t *BlueStore::_get_deferred_op(
   return &txc->deferred_txn->ops.back();
 }
 
+uint32_t BlueStore::_sqrt_2_power(uint power) {
+  constexpr double sqrt_2 = sqrt(2.0);
+  uint32_t result = uint32_t(1) << (power / 2);
+  if (power & 1) {
+    result = uint32_t(result * sqrt_2);
+  }
+  return result;
+}
+
+void BlueStore::_set_throttle(uint32_t throttle) {
+  ostringstream s;
+  s << throttle;
+  cct->_conf->set_val("bluestore_max_bytes", s.str());
+  cct->_conf->call_all_observers();
+  dout(10) << __func__ << " throttle set to " << throttle << dendl;
+}
+
 void BlueStore::_throttle_mgmt_thread() {
   dout(10) << __func__ << " start" << dendl;
+
+  constexpr auto counter = l_bluestore_commit_lat;
+  constexpr uint poll_secs = 2;
+  constexpr uint64_t upper_limit_avg = 125;
+  constexpr uint64_t lower_limit_avg = 75;
+  constexpr uint poll_cycles = 5;
+  constexpr uint min_power = 24;
+
+  // thresh_count >=3 or <=-3 triggers throttle change
+  constexpr int thresh_limit = 3;
+
+  std::chrono::seconds poll_time(poll_secs);
+
+  // power is the power the square root of 2 is taken to
+  uint power = 24; // 24=4k, 26=8k,
+  _set_throttle(_sqrt_2_power(power));
+
+  utime_t prev_time = ceph_clock_now();
+  pair<uint64_t,uint64_t> prev_avg = logger->get_tavg_ms(counter);
+
   std::unique_lock<std::mutex> l(throttle_mgmt_lock);
-  std::chrono::seconds wait_time(15);
+  uint poll_count = 0;
+  int thresh_count = 0;
   while (true) {
+    auto r = throttle_mgmt_cond.wait_for(l, poll_time);
     if (throttle_mgmt_stop) break;
-    // std::this_thread::sleep_for(wait_time);
-    auto r = throttle_mgmt_cond.wait_for(l, wait_time);
-    if (std::cv_status::timeout == r) {
-      dout(10) << __func__ << " timeout" << dendl;
-      cct->_conf->set_val("bluestore_max_bytes", "68000");
-      cct->_conf->call_all_observers();
-    } else {
-      dout(10) << __func__ << " spurious" << dendl;
-    }
-  }
+
+    utime_t now = ceph_clock_now();
+    if (std::cv_status::timeout == r || now - prev_time >= poll_secs) {
+      pair<uint64_t,uint64_t> this_avg = logger->get_tavg_ms(counter);
+      ++poll_count;
+      assert(this_avg.first >= prev_avg.first);
+
+      if (this_avg.first == prev_avg.first) { // no new data
+	if (poll_count >= poll_cycles) {
+	  poll_count = 0;
+	  thresh_count = 0;
+	}
+	continue;
+      }
+
+      double window_avg =
+	(this_avg.second - prev_avg.second) /
+	double(this_avg.first - prev_avg.first);
+      if (window_avg > upper_limit_avg) {
+	++thresh_count;
+      } else if (window_avg < lower_limit_avg) {
+	--thresh_count;
+      }
+      if (thresh_count >= thresh_limit) {
+	++power;
+	_set_throttle(_sqrt_2_power(power));
+	poll_count = 0;
+	thresh_count = 0;
+      } else if (thresh_count <= -thresh_limit) {
+	if (power > min_power) {
+	  --power;
+	  _set_throttle(_sqrt_2_power(power));
+	}
+	poll_count = 0;
+	thresh_count = 0;
+      } else if (poll_count >= poll_cycles) {
+	poll_count = 0;
+	thresh_count = 0;
+      }
+
+      prev_avg = this_avg;
+    } // if time to poll...
+
+    prev_time = now;
+  } // thread loop
+
   dout(10) << __func__ << " finish" << dendl;
 }
 

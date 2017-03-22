@@ -2221,6 +2221,9 @@ private:
 
 private:
 
+  static uint32_t _sqrt_2_power(uint power);
+  void _set_throttle(uint32_t throttle);
+
   // --------------------------------------------------------
   // read processing internal methods
   int _verify_csum(
