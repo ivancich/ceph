@@ -1920,6 +1920,7 @@ private:
 
   void _throttle_mgmt_thread();
   void _throttle_mgmt_stop() {
+    if (!throttle_mgmt_thread.is_started()) return;
     {
       std::lock_guard<std::mutex> l(throttle_mgmt_lock);
       throttle_mgmt_stop = true;

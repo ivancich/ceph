@@ -3278,8 +3278,19 @@ void BlueStore::handle_conf_change(const struct md_config_t *conf,
     std::unique_lock<std::mutex> l(throttle_mgmt_lock);
 
     if (changed.count("bluestore_latency_managed_throttle")) {
-      // TODO: stop thread if this is false; start thread if this is true
-      latency_managed_throttle = conf->bluestore_latency_managed_throttle;
+      if (latency_managed_throttle != conf->bluestore_latency_managed_throttle) {
+	latency_managed_throttle = conf->bluestore_latency_managed_throttle;
+	if (latency_managed_throttle) {
+	  if (!throttle_mgmt_thread.is_started()) {
+	    throttle_mgmt_thread.create("bstore_thrt_mgt");
+	  }
+	} else {
+	  // function checks to make sure it's started
+	  l.unlock();
+	  _throttle_mgmt_stop();
+	  l.lock();
+	}
+      }
     }
     if (changed.count("bluestore_throttle_latency_min")) {
       throttle_latency_min = conf->bluestore_throttle_latency_min;
@@ -4805,7 +4816,9 @@ int BlueStore::mount()
   _set_csum();
   _set_compression();
 
-  throttle_mgmt_thread.create("bstore_thrt_mgt");
+  if (latency_managed_throttle) {
+    throttle_mgmt_thread.create("bstore_thrt_mgt");
+  }
 
   mounted = true;
   return 0;
@@ -7817,18 +7830,18 @@ void BlueStore::_throttle_mgmt_thread() {
   dout(10) << __func__ << " start" << dendl;
 
   constexpr auto counter = l_bluestore_commit_lat;
-  // constexpr uint poll_secs = 2;
-  // constexpr uint64_t upper_limit_avg = 125;
-  // constexpr uint64_t lower_limit_avg = 75;
   constexpr uint poll_cycles = 5;
   constexpr uint min_power = 24;
 
   // thresh_count >=3 or <=-3 triggers throttle change
   constexpr int thresh_limit = 3;
 
-  // power is the power the square root of 2 is taken to
-  uint power = 24; // 24=4k, 26=8k,
-  _set_throttle(_sqrt_2_power(power));
+  // power is the power the square root of 2 is taken to, e.g., 24=4k,
+  // 26=8k,
+  uint power = uint(0.5 + 2 * log2(throttle_bytes.get_max()));
+  if (power < min_power) power = min_power;
+  dout(10) << __func__ << " throttle is " << throttle_bytes.get_max() <<
+    " so throttle power set at " << power << dendl;
 
   utime_t prev_time = ceph_clock_now();
   pair<uint64_t,uint64_t> prev_avg = logger->get_tavg_ms(counter);
