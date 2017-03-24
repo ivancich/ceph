@@ -3133,6 +3133,10 @@ BlueStore::BlueStore(CephContext *cct, const string& path)
     throttle_deferred_bytes(cct, "bluestore_deferred_max_bytes",
 		       cct->_conf->bluestore_max_bytes +
 		       cct->_conf->bluestore_deferred_max_bytes),
+    latency_managed_throttle(cct->_conf->bluestore_latency_managed_throttle),
+    throttle_latency_min(cct->_conf->bluestore_throttle_latency_min),
+    throttle_latency_max(cct->_conf->bluestore_throttle_latency_max),
+    throttle_latency_window(std::chrono::milliseconds(cct->_conf->bluestore_throttle_latency_window_msec)),
     kv_sync_thread(this),
     mempool_thread(this)
 {
@@ -3165,6 +3169,10 @@ BlueStore::BlueStore(CephContext *cct,
     throttle_deferred_bytes(cct, "bluestore_deferred_max_bytes",
 		       cct->_conf->bluestore_max_bytes +
 		       cct->_conf->bluestore_deferred_max_bytes),
+    latency_managed_throttle(cct->_conf->bluestore_latency_managed_throttle),
+    throttle_latency_min(cct->_conf->bluestore_throttle_latency_min),
+    throttle_latency_max(cct->_conf->bluestore_throttle_latency_max),
+    throttle_latency_window(std::chrono::milliseconds(cct->_conf->bluestore_throttle_latency_window_msec)),
     kv_sync_thread(this),
     min_alloc_size(_min_alloc_size),
     min_alloc_size_order(ctz(_min_alloc_size)),
@@ -3220,6 +3228,10 @@ const char **BlueStore::get_tracked_conf_keys() const
     "bluestore_max_bytes",
     "bluestore_deferred_max_ops",
     "bluestore_deferred_max_bytes",
+    "bluestore_latency_managed_throttle",
+    "bluestore_throttle_latency_min",
+    "bluestore_throttle_latency_max",
+    "bluestore_throttle_latency_window_msec",
     NULL
   };
   return KEYS;
@@ -3244,6 +3256,7 @@ void BlueStore::handle_conf_change(const struct md_config_t *conf,
       _set_alloc_sizes();
     }
   }
+
   if (changed.count("bluestore_max_ops")) {
     throttle_ops.reset_max(conf->bluestore_max_ops);
   }
@@ -3255,6 +3268,30 @@ void BlueStore::handle_conf_change(const struct md_config_t *conf,
   }
   if (changed.count("bluestore_deferred_max_bytes")) {
     throttle_deferred_bytes.reset_max(conf->bluestore_deferred_max_bytes);
+  }
+
+  if (changed.count("bluestore_latency_managed_throttle") ||
+      changed.count("bluestore_throttle_latency_min") ||
+      changed.count("bluestore_throttle_latency_max") ||
+      changed.count("bluestore_throttle_latency_window_msec")) {
+    // make sure throttle_mgmt_thread is waiting
+    std::unique_lock<std::mutex> l(throttle_mgmt_lock);
+
+    if (changed.count("bluestore_latency_managed_throttle")) {
+      // TODO: stop thread if this is false; start thread if this is true
+      latency_managed_throttle = conf->bluestore_latency_managed_throttle;
+    }
+    if (changed.count("bluestore_throttle_latency_min")) {
+      throttle_latency_min = conf->bluestore_throttle_latency_min;
+    }
+    if (changed.count("bluestore_throttle_latency_max")) {
+      throttle_latency_max = conf->bluestore_throttle_latency_max;
+    }
+    if (changed.count("bluestore_throttle_latency_window_msec")) {
+      throttle_latency_window = 
+	std::chrono::milliseconds(
+	  conf->bluestore_throttle_latency_window_msec);
+    }
   }
 }
 
@@ -7389,7 +7426,9 @@ void BlueStore::_txc_committed_kv(TransContext *txc)
   if (!txc->oncommits.empty()) {
     finishers[n]->queue(txc->oncommits);
   }
-  throttle_ops.put(txc->ops);
+  if (!latency_managed_throttle) {
+    throttle_ops.put(txc->ops);
+  }
   throttle_bytes.put(txc->bytes);
 }
 
@@ -7766,6 +7805,7 @@ uint32_t BlueStore::_sqrt_2_power(uint power) {
 }
 
 void BlueStore::_set_throttle(uint32_t throttle) {
+  dout(10) << __func__ << " throttle will be set to " << throttle << dendl;
   ostringstream s;
   s << throttle;
   cct->_conf->set_val("bluestore_max_bytes", s.str());
@@ -7777,16 +7817,14 @@ void BlueStore::_throttle_mgmt_thread() {
   dout(10) << __func__ << " start" << dendl;
 
   constexpr auto counter = l_bluestore_commit_lat;
-  constexpr uint poll_secs = 2;
-  constexpr uint64_t upper_limit_avg = 125;
-  constexpr uint64_t lower_limit_avg = 75;
+  // constexpr uint poll_secs = 2;
+  // constexpr uint64_t upper_limit_avg = 125;
+  // constexpr uint64_t lower_limit_avg = 75;
   constexpr uint poll_cycles = 5;
   constexpr uint min_power = 24;
 
   // thresh_count >=3 or <=-3 triggers throttle change
   constexpr int thresh_limit = 3;
-
-  std::chrono::seconds poll_time(poll_secs);
 
   // power is the power the square root of 2 is taken to
   uint power = 24; // 24=4k, 26=8k,
@@ -7799,14 +7837,24 @@ void BlueStore::_throttle_mgmt_thread() {
   uint poll_count = 0;
   int thresh_count = 0;
   while (true) {
-    auto r = throttle_mgmt_cond.wait_for(l, poll_time);
+    // use a copy in call to wait_for, as the duration is a const
+    // reference, and it could be changed while waiting
+    auto duration_copy = throttle_latency_window;
+    auto r = throttle_mgmt_cond.wait_for(l, duration_copy);
+    
     if (throttle_mgmt_stop) break;
 
+    // TODO: should probably stop thread in this case
+    if (!latency_managed_throttle) continue;
+
     utime_t now = ceph_clock_now();
-    if (std::cv_status::timeout == r || now - prev_time >= poll_secs) {
+    if (std::cv_status::timeout == r) {
+      // TODO; maybe handle case where it's not a timeout and we can re-sleep
       pair<uint64_t,uint64_t> this_avg = logger->get_tavg_ms(counter);
       ++poll_count;
       assert(this_avg.first >= prev_avg.first);
+      dout(30) << __func__ << " latency:(" << this_avg.first <<
+	"," << this_avg.second << ")" << dendl;
 
       if (this_avg.first == prev_avg.first) { // no new data
 	if (poll_count >= poll_cycles) {
@@ -7819,20 +7867,32 @@ void BlueStore::_throttle_mgmt_thread() {
       double window_avg =
 	(this_avg.second - prev_avg.second) /
 	double(this_avg.first - prev_avg.first);
-      if (window_avg > upper_limit_avg) {
+      dout(30) << __func__ << " average:" << window_avg << dendl;
+
+      if (window_avg > throttle_latency_max) {
 	++thresh_count;
-      } else if (window_avg < lower_limit_avg) {
+      } else if (window_avg < throttle_latency_min) {
 	--thresh_count;
       }
       if (thresh_count >= thresh_limit) {
 	++power;
+	dout(10) << __func__ << " before set_throttle" << dendl;
+	// when the config options are changed might need to take
+	// lock in this thread
+	l.unlock(); 
 	_set_throttle(_sqrt_2_power(power));
+	l.lock();
+	dout(10) << __func__ << " after set_throttle" << dendl;
 	poll_count = 0;
 	thresh_count = 0;
       } else if (thresh_count <= -thresh_limit) {
 	if (power > min_power) {
 	  --power;
+	  // when the config options are changed might need to take
+	  // lock in this thread
+	  l.unlock();
 	  _set_throttle(_sqrt_2_power(power));
+	  l.lock();
 	}
 	poll_count = 0;
 	thresh_count = 0;
@@ -7960,8 +8020,10 @@ int BlueStore::_deferred_finish(TransContext *txc)
     TransContext *txc = &i;
     txc->state = TransContext::STATE_DEFERRED_CLEANUP;
     txc->osr->qcond.notify_all();
-    throttle_deferred_ops.put(txc->ops);
-    throttle_deferred_bytes.put(txc->bytes);
+    if (!latency_managed_throttle) {
+      throttle_deferred_ops.put(txc->ops);
+      throttle_deferred_bytes.put(txc->bytes);
+    }
     deferred_done_queue.push_back(txc);
   }
   finished.clear();
@@ -8074,17 +8136,23 @@ int BlueStore::queue_transactions(
     handle->suspend_tp_timeout();
 
   utime_t tstart = ceph_clock_now();
-  throttle_ops.get(txc->ops);
+  if (!latency_managed_throttle) {
+    throttle_ops.get(txc->ops);
+  }
   throttle_bytes.get(txc->bytes);
   if (txc->deferred_txn) {
     // ensure we do not block here because of deferred writes
     if (!throttle_deferred_ops.get_or_fail(txc->ops)) {
       deferred_try_submit();
-      throttle_deferred_ops.get(txc->ops);
+      if (!latency_managed_throttle) {
+	throttle_deferred_ops.get(txc->ops);
+      }
     }
     if (!throttle_deferred_bytes.get_or_fail(txc->bytes)) {
       deferred_try_submit();
-      throttle_deferred_bytes.get(txc->bytes);
+      if (!latency_managed_throttle) {
+	throttle_deferred_bytes.get(txc->bytes);
+      }
     }
   }
   utime_t tend = ceph_clock_now();

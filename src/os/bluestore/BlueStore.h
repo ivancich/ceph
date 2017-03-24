@@ -1697,6 +1697,10 @@ private:
   Throttle throttle_ops, throttle_bytes;          ///< submit to commit
   Throttle throttle_deferred_ops, throttle_deferred_bytes;  ///< submit to deferred complete
 
+  bool latency_managed_throttle;
+  uint32_t throttle_latency_min, throttle_latency_max;
+  std::chrono::milliseconds throttle_latency_window;
+
   interval_set<uint64_t> bluefs_extents;  ///< block extents owned by bluefs
   interval_set<uint64_t> bluefs_extents_reclaiming; ///< currently reclaiming
 
