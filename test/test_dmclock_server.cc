@@ -16,6 +16,9 @@
 #include "dmclock_util.h"
 #include "gtest/gtest.h"
 
+// process control to prevent core dumps during gtest death tests
+#include "dmcPrCtl.h"
+
 
 namespace dmc = crimson::dmclock;
 
@@ -63,6 +66,9 @@ namespace crimson {
       QueueRef pq(new Queue(client_info_f, false));
       Request req;
       ReqParams req_params(1,1);
+
+      // Disable coredumps
+      PrCtl unset_dumpable;
 
       EXPECT_DEATH_IF_SUPPORTED(pq->add_request(req, client1, req_params),
 				"Assertion.*reservation.*max_tag.*"
