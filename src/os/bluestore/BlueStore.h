@@ -3,7 +3,7 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2014 Red Hat
+ * Copyright (C) 2016 Red Hat
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -39,11 +39,18 @@
 
 #include "bluestore_types.h"
 #include "BlockDevice.h"
+
+#include "common/AltThrottle.h"
+
+
+#define MIN_THROTTLE
+//#define DEBUG_CACHE
+
+
 class Allocator;
 class FreelistManager;
 class BlueFS;
 
-//#define DEBUG_CACHE
 
 enum {
   l_bluestore_first = 732430,
@@ -92,6 +99,10 @@ enum {
   l_bluestore_write_small_wal,
   l_bluestore_write_small_pre_read,
   l_bluestore_write_small_new,
+  l_bluestore_cur_ops_in_queue,
+  l_bluestore_cur_bytes_in_queue,
+  l_bluestore_cur_ops_in_wal_queue,
+  l_bluestore_cur_bytes_in_wal_queue,
   l_bluestore_txc,
   l_bluestore_onode_reshard,
   l_bluestore_blob_split,
@@ -197,7 +208,7 @@ public:
       f->dump_unsigned("length", length);
       f->dump_unsigned("data_length", data.length());
     }
-  };
+  }; // struct Buffer
 
   struct Cache;
 
@@ -318,7 +329,7 @@ public:
       }
       f->close_section();
     }
-  };
+  }; // struct BufferSpace
 
   struct SharedBlobSet;
 
@@ -360,7 +371,7 @@ public:
       rjhash<uint32_t> h;
       return h(e.sbid);
     }
-  };
+  }; // struct SharedBlob
   typedef boost::intrusive_ptr<SharedBlob> SharedBlobRef;
 
   /// a lookup table of SharedBlobs
@@ -553,7 +564,7 @@ public:
       }
     }
 #endif
-  };
+  }; // struct Blob
   typedef boost::intrusive_ptr<Blob> BlobRef;
   typedef mempool::bluestore_meta_other::map<int,BlobRef> blob_map_t;
 
@@ -772,7 +783,7 @@ public:
       uint8_t  *blob_depth,
       uint64_t *gc_start_offset,
       uint64_t *gc_end_offset);
-  };
+  }; // struct ExtentMap
 
   struct OnodeSpace;
 
@@ -1483,6 +1494,7 @@ public:
   // --------------------------------------------------------
   // members
 private:
+
   CephContext *cct;
   BlueFS *bluefs;
   unsigned bluefs_shared_bdev;  ///< which bluefs bdev we are sharing
@@ -1506,8 +1518,18 @@ private:
   std::atomic<uint64_t> blobid_last = {0};
   std::atomic<uint64_t> blobid_max = {0};
 
+#if defined MIN_THROTTLE
+  Throttle throttle_bytes;
+#elif defined MODEL_THROTTLE
+  DataCollectionThrottle<TransContext*> throttle_ops, throttle_bytes;
+  DataCollectionThrottle<TransContext*> throttle_wal_ops, throttle_wal_bytes;
+#elif defined CUBIC_THROTTLE
+  CubicModelThrottle throttle_ops, throttle_bytes;          ///< submit to commit
+  CubicModelThrottle throttle_wal_ops, throttle_wal_bytes;  ///< submit to commit
+#else
   Throttle throttle_ops, throttle_bytes;          ///< submit to commit
   Throttle throttle_wal_ops, throttle_wal_bytes;  ///< submit to wal complete
+#endif
 
   interval_set<uint64_t> bluefs_extents;  ///< block extents owned by bluefs
 
@@ -1600,6 +1622,8 @@ private:
   void _init_logger();
   void _shutdown_logger();
   int _reload_logger();
+
+  int _set_throttle_params();
 
   int _open_path();
   void _close_path();
@@ -2159,6 +2183,10 @@ private:
 			CollectionRef& d,
 			unsigned bits, int rem);
 
+  void op_queue_reserve_throttle(TransContext *txc);
+  void op_queue_release_throttle(TransContext *txc);
+  void op_queue_reserve_wal_throttle(TransContext *txc);
+  void op_queue_release_wal_throttle(TransContext *txc);
 };
 
 inline ostream& operator<<(ostream& out, const BlueStore::OpSequencer& s) {
